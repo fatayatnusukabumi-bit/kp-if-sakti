@@ -1,0 +1,238 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Anggota;
+use App\Models\Kegiatan;
+use App\Models\PAC;
+use Carbon\Carbon;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Support\Facades\DB;
+
+class DashboardController extends Controller
+{
+    public function index()
+    {
+        $now = now();
+        $currentMonthStart = $now->copy()->startOfMonth();
+        $currentMonthEnd = $now->copy()->endOfMonth();
+        $previousMonthStart = $now->copy()->subMonthNoOverflow()->startOfMonth();
+        $previousMonthEnd = $now->copy()->subMonthNoOverflow()->endOfMonth();
+
+        $totalAnggota = Anggota::count();
+        $totalPAC = PAC::count();
+        $totalKegiatan = Kegiatan::count();
+        $pacAktif = PAC::where('status', 'aktif')->count();
+        $pacTidakAktif = max($totalPAC - $pacAktif, 0);
+        $skAktif = PAC::where('status', 'aktif')
+            ->whereNotNull('nomor_sk')
+            ->where('nomor_sk', '!=', '')
+            ->count();
+
+        $anggotaBulanIni = $this->countInPeriod(
+            Anggota::query(),
+            'tanggal_bergabung',
+            $currentMonthStart,
+            $currentMonthEnd
+        );
+        $anggotaBulanLalu = $this->countInPeriod(
+            Anggota::query(),
+            'tanggal_bergabung',
+            $previousMonthStart,
+            $previousMonthEnd
+        );
+        $pacBulanIni = $this->countInPeriod(
+            PAC::where('status', 'aktif'),
+            'created_at',
+            $currentMonthStart,
+            $currentMonthEnd
+        );
+        $pacBulanLalu = $this->countInPeriod(
+            PAC::where('status', 'aktif'),
+            'created_at',
+            $previousMonthStart,
+            $previousMonthEnd
+        );
+        $kegiatanBulanIni = $this->countInPeriod(
+            Kegiatan::query(),
+            'tanggal',
+            $currentMonthStart,
+            $currentMonthEnd
+        );
+        $kegiatanBulanLalu = $this->countInPeriod(
+            Kegiatan::query(),
+            'tanggal',
+            $previousMonthStart,
+            $previousMonthEnd
+        );
+        $skBulanIni = $this->countInPeriod(
+            PAC::where('status', 'aktif')
+                ->whereNotNull('nomor_sk')
+                ->where('nomor_sk', '!=', ''),
+            'created_at',
+            $currentMonthStart,
+            $currentMonthEnd
+        );
+        $skBulanLalu = $this->countInPeriod(
+            PAC::where('status', 'aktif')
+                ->whereNotNull('nomor_sk')
+                ->where('nomor_sk', '!=', ''),
+            'created_at',
+            $previousMonthStart,
+            $previousMonthEnd
+        );
+
+        $growth = [
+            'anggota' => $this->percentageGrowth($anggotaBulanIni, $anggotaBulanLalu),
+            'pac' => $this->percentageGrowth($pacBulanIni, $pacBulanLalu),
+            'kegiatan' => $this->percentageGrowth($kegiatanBulanIni, $kegiatanBulanLalu),
+            'sk' => $this->percentageGrowth($skBulanIni, $skBulanLalu),
+        ];
+
+        $driver = DB::connection()->getDriverName();
+        $isSqlite = $driver === 'sqlite';
+        $monthFormatSql = $isSqlite
+            ? "strftime('%Y-%m', tanggal_bergabung)"
+            : "DATE_FORMAT(tanggal_bergabung, '%Y-%m')";
+
+        $windowStart = $now->copy()->subMonthsNoOverflow(5)->startOfMonth();
+
+        $baseCount = Anggota::where('tanggal_bergabung', '<', $windowStart->toDateString())->count();
+
+        $joinedPerMonth = Anggota::query()
+            ->whereBetween('tanggal_bergabung', [$windowStart->toDateString(), $currentMonthEnd->toDateString()])
+            ->selectRaw("{$monthFormatSql} as ym, COUNT(*) as total")
+            ->groupBy('ym')
+            ->pluck('total', 'ym');
+
+        $runningTotal = $baseCount;
+        $anggotaGrowthChart = collect(range(5, 0))
+            ->map(function (int $monthsAgo) use ($now, $joinedPerMonth, &$runningTotal) {
+                $month = $now->copy()->subMonthsNoOverflow($monthsAgo);
+                $ym = $month->format('Y-m');
+                $runningTotal += (int) ($joinedPerMonth[$ym] ?? 0);
+
+                return [
+                    'label' => $month->locale('id')->translatedFormat('M'),
+                    'total' => $runningTotal,
+                ];
+            });
+
+        $profesiChart = Anggota::selectRaw('profesi, COUNT(*) as total')
+            ->groupBy('profesi')
+            ->orderByDesc('total')
+            ->limit(5)
+            ->get();
+
+        $anggotaBulanIniMap = Anggota::query()
+            ->selectRaw('LOWER(TRIM(pac)) as pac_name, COUNT(*) as total')
+            ->whereBetween('tanggal_bergabung', [$currentMonthStart, $currentMonthEnd])
+            ->groupBy('pac_name')
+            ->pluck('total', 'pac_name');
+
+        $anggotaBulanLaluMap = Anggota::query()
+            ->selectRaw('LOWER(TRIM(pac)) as pac_name, COUNT(*) as total')
+            ->whereBetween('tanggal_bergabung', [$previousMonthStart, $previousMonthEnd])
+            ->groupBy('pac_name')
+            ->pluck('total', 'pac_name');
+
+        $topPAC = PAC::orderByDesc('jumlah_anggota')
+            ->take(5)
+            ->get()
+            ->map(function (PAC $pac) use (
+                $anggotaBulanIniMap,
+                $anggotaBulanLaluMap
+            ) {
+                $namaKey = strtolower(trim($pac->nama_pac));
+                $kecKey = strtolower(trim($pac->kecamatan));
+
+                $anggotaBulanIni = $anggotaBulanIniMap->get($namaKey) ?? $anggotaBulanIniMap->get($kecKey) ?? 0;
+                $anggotaBulanLalu = $anggotaBulanLaluMap->get($namaKey) ?? $anggotaBulanLaluMap->get($kecKey) ?? 0;
+
+                $pac->growth = $this->percentageGrowth(
+                    $anggotaBulanIni,
+                    $anggotaBulanLalu
+                );
+
+                return $pac;
+            });
+
+        $aktivitasTerbaru = collect()
+            ->concat(
+                Anggota::latest()->take(5)->get()->map(fn (Anggota $anggota) => [
+                    'judul' => 'Anggota baru - '.$anggota->nama,
+                    'waktu' => $anggota->created_at,
+                    'jenis' => 'anggota',
+                ])
+            )
+            ->concat(
+                PAC::latest()->take(5)->get()->map(fn (PAC $pac) => [
+                    'judul' => 'Data '.$pac->nama_pac.' diperbarui',
+                    'waktu' => $pac->updated_at,
+                    'jenis' => 'pac',
+                ])
+            )
+            ->concat(
+                Kegiatan::latest()->take(5)->get()->map(fn (Kegiatan $kegiatan) => [
+                    'judul' => $kegiatan->judul.' - '.number_format($kegiatan->peserta).' peserta',
+                    'waktu' => $kegiatan->updated_at,
+                    'jenis' => 'kegiatan',
+                ])
+            )
+            ->sortByDesc('waktu')
+            ->take(5)
+            ->values();
+
+        $pengajuanPACPending = PAC::where('status', 'pending')
+            ->orderByDesc('id')
+            ->take(5)
+            ->get();
+        $pendingPacCount = PAC::where('status', 'pending')->count();
+
+        $lastUpdated = collect([
+            Anggota::max('updated_at'),
+            PAC::max('updated_at'),
+            Kegiatan::max('updated_at'),
+        ])
+            ->filter()
+            ->map(fn ($date) => Carbon::parse($date))
+            ->sortDesc()
+            ->first() ?? $now;
+
+        return view('dashboard', compact(
+            'totalAnggota',
+            'totalPAC',
+            'totalKegiatan',
+            'pacAktif',
+            'pacTidakAktif',
+            'skAktif',
+            'kegiatanBulanIni',
+            'growth',
+            'anggotaGrowthChart',
+            'profesiChart',
+            'aktivitasTerbaru',
+            'topPAC',
+            'pengajuanPACPending',
+            'pendingPacCount',
+            'lastUpdated'
+        ));
+    }
+
+    private function countInPeriod(
+        Builder $query,
+        string $column,
+        Carbon $start,
+        Carbon $end
+    ): int {
+        return $query->whereBetween($column, [$start, $end])->count();
+    }
+
+    private function percentageGrowth(int $current, int $previous): int
+    {
+        if ($previous === 0) {
+            return $current > 0 ? 100 : 0;
+        }
+
+        return (int) round((($current - $previous) / $previous) * 100);
+    }
+}
